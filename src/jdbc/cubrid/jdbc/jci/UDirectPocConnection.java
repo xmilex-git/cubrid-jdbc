@@ -157,6 +157,19 @@ final class UDirectPocConnection implements Closeable {
                             + ", rows="
                             + rowCount);
         }
+        /*
+         * Sanity-check the advertised shape against the actual payload before
+         * allocating arrays: every value occupies at least 8 bytes (tag+length).
+         */
+        if ((long) rowCount * colCount * 8L > (long) response.remaining()) {
+            throw new IOException(
+                    "JDBC direct execute: response shape "
+                            + rowCount
+                            + "x"
+                            + colCount
+                            + " exceeds payload size "
+                            + response.remaining());
+        }
 
         Object[][] rows = new Object[rowCount][];
         for (int r = 0; r < rowCount; r++) {

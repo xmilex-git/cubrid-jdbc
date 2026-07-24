@@ -1331,16 +1331,23 @@ public abstract class UConnection {
             return null;
         }
 
-        if (connectionProperties.getDirectPreparedPoc() && stmt.isDirectCandidate()) {
+        if (connectionProperties.getDirectPreparedPoc()
+                && brokerInfoStatementPooling()
+                && stmt.isDirectCandidate()
+                && isDirectDefaultIsolation()) {
             try {
                 outBuffer.newRequest(output, UFunctionCode.JDBC_DIRECT_POC_TAKE_XASL);
                 outBuffer.addInt(stmt.getServerHandler());
                 inBuffer = send_recv_msg();
                 stmt.setDirectXaslId(inBuffer.readBytes(28));
             } catch (UJciException e) {
-                /* CAS declined (e.g. not direct-eligible): fall back to the CAS path */
-            } catch (IOException e) {
-                /* transport hiccup on the control channel: fall back to the CAS path */
+                if (e.getJciError() == UErrorCode.ER_DBMS
+                        && e.getServerErrorCode() == UErrorCode.CAS_ER_ARGS) {
+                    /* CAS explicitly declined (not direct-eligible): CAS path fallback */
+                } else {
+                    /* protocol/communication error: connection state is unknown, propagate */
+                    throw e;
+                }
             }
         }
 
@@ -1351,6 +1358,25 @@ public abstract class UConnection {
 
     boolean isDirectPreparedPoc() {
         return connectionProperties.getDirectPreparedPoc();
+    }
+
+    /*
+     * Direct execution registers its server transaction with
+     * TRAN_DEFAULT_ISOLATION_LEVEL() == TRAN_READ_COMMITTED. The statement is
+     * direct-eligible only while the connection's effective isolation matches;
+     * anything else (explicit setTransactionIsolation or a non-default server
+     * isolation_level conf) demotes to the CAS path.
+     */
+    boolean isDirectDefaultIsolation() {
+        int level = lastIsolationLevel;
+        if (level == CUBRIDIsolationLevel.TRAN_UNKNOWN_ISOLATION) {
+            level = getIsolationLevel();
+        }
+        return level == CUBRIDIsolationLevel.TRAN_READ_COMMITTED;
+    }
+
+    boolean isDirectDefaultIsolationCached() {
+        return lastIsolationLevel == CUBRIDIsolationLevel.TRAN_READ_COMMITTED;
     }
 
     Object[][] executeDirect(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,

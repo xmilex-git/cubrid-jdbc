@@ -920,12 +920,36 @@ public class UStatement {
 
     /*
      * Attempts the direct-server execute path. Returns false when the statement
-     * must be demoted to the normal CAS path (e.g. unsupported bind type).
+     * must be demoted to the normal CAS path (e.g. unsupported bind type or an
+     * execution option whose semantics direct cannot preserve).
      */
-    private boolean tryExecuteDirect() throws IOException {
+    private boolean tryExecuteDirect(
+            int maxRow,
+            int maxField,
+            boolean isScrollable,
+            boolean isSensitive,
+            boolean isAsync,
+            boolean isExecuteAll,
+            boolean isQueryPlan,
+            boolean isOnlyPlan,
+            int queryTimeout)
+            throws IOException {
         if (directXaslId == null
                 || !isDirectCandidate()
-                || !relatedConnection.getAutoCommit()) {
+                || !relatedConnection.getAutoCommit()
+                || !relatedConnection.isDirectDefaultIsolationCached()) {
+            return false;
+        }
+        /* execution options direct does not preserve: demote to the CAS path */
+        if (maxRow > 0
+                || maxField > 0
+                || isScrollable
+                || isSensitive
+                || isAsync
+                || isExecuteAll
+                || isQueryPlan
+                || isOnlyPlan
+                || queryTimeout > 0) {
             return false;
         }
 
@@ -1036,7 +1060,17 @@ public class UStatement {
         boolean isFirstExecInTran = !relatedConnection.isActive();
 
         try {
-            if (relatedConnection.isDirectPreparedPoc() && tryExecuteDirect()) {
+            if (relatedConnection.isDirectPreparedPoc()
+                    && tryExecuteDirect(
+                            maxRow,
+                            maxField,
+                            isScrollable,
+                            isSensitive,
+                            isAsync,
+                            isExecuteAll,
+                            isQueryPlan,
+                            isOnlyPlan,
+                            queryTimeout)) {
                 return;
             }
             executeInternal(maxRow, maxField, isScrollable, queryTimeout, cacheData);
