@@ -427,6 +427,12 @@ public class ConnectionProperties {
     BooleanConnectionProperty usePreparedStmtCache =
             new BooleanConnectionProperty("usePreparedStmtCache", false);
 
+    BooleanConnectionProperty directPreparedPoc =
+            new BooleanConnectionProperty("directPreparedPoc", false);
+
+    IntegerConnectionProperty directServerPort =
+            new IntegerConnectionProperty("directServerPort", 0, 0, 65535);
+
     IntegerConnectionProperty preparedStmtCacheSize =
             new IntegerConnectionProperty("preparedStmtCacheSize", 25, 1, Integer.MAX_VALUE);
 
@@ -511,6 +517,14 @@ public class ConnectionProperties {
 
     public boolean getPrepStmtCache() {
         return usePreparedStmtCache.getValueAsBoolean();
+    }
+
+    public boolean getDirectPreparedPoc() {
+        return directPreparedPoc.getValueAsBoolean();
+    }
+
+    public int getDirectServerPort() {
+        return directServerPort.getValueAsInteger();
     }
 
     public int getPrepStmtCacheSize() {

@@ -127,6 +127,7 @@ public class UStatement {
     private UInputBuffer tmp_inbuffer;
     private boolean isAutoCommit = false;
     private boolean isGeneratedKeys = false;
+    private byte[] directXaslId = null;
 
     /*
      * 3.0 private int resultset_index; private int resultset_index_flag;
@@ -896,6 +897,42 @@ public class UStatement {
         }
     }
 
+    int getServerHandler() {
+        return serverHandler;
+    }
+
+    boolean isDirectSelect1Candidate() {
+        if (commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT || parameterNumber != 0) {
+            return false;
+        }
+        String normalized = sql_stmt == null ? "" : sql_stmt.trim();
+        if (normalized.endsWith(";")) {
+            normalized = normalized.substring(0, normalized.length() - 1).trim();
+        }
+        return normalized.equalsIgnoreCase("select 1");
+    }
+
+    void setDirectXaslId(byte[] packedXaslId) {
+        directXaslId = packedXaslId;
+    }
+
+    private void executeDirectSelect1() throws IOException {
+        int value = relatedConnection.executeDirectSelect1(directXaslId);
+
+        executeResult = 1;
+        totalTupleNumber = 1;
+        fetchedTupleNumber = 1;
+        fetchedSize = Integer.SIZE / Byte.SIZE;
+        currentFirstCursor = 0;
+        cursorPosition = -1;
+        isFetchCompleted = true;
+        realFetched = true;
+
+        resultInfo = new UResultInfo[] {new UResultInfo(commandTypeIs, 1)};
+        tuples = new UResultTuple[] {new UResultTuple(1, columnNumber)};
+        tuples[0].setAttribute(0, Integer.valueOf(value));
+    }
+
     public synchronized void execute(
             boolean isAsync,
             int maxRow,
@@ -951,6 +988,13 @@ public class UStatement {
         boolean isFirstExecInTran = !relatedConnection.isActive();
 
         try {
+            if (relatedConnection.isDirectPreparedPoc()) {
+                if (directXaslId == null || !isDirectSelect1Candidate() || !relatedConnection.getAutoCommit()) {
+                    throw new UJciException(UErrorCode.CAS_ER_NOT_IMPLEMENTED);
+                }
+                executeDirectSelect1();
+                return;
+            }
             executeInternal(maxRow, maxField, isScrollable, queryTimeout, cacheData);
             return;
         } catch (UJciException e) {

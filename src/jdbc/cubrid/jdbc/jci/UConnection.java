@@ -1331,9 +1331,28 @@ public abstract class UConnection {
             return null;
         }
 
+        if (connectionProperties.getDirectPreparedPoc()) {
+            if (!stmt.isDirectSelect1Candidate()) {
+                errorHandler.setErrorCode(UErrorCode.CAS_ER_NOT_IMPLEMENTED);
+                return null;
+            }
+            outBuffer.newRequest(output, UFunctionCode.JDBC_DIRECT_POC_TAKE_XASL);
+            outBuffer.addInt(stmt.getServerHandler());
+            inBuffer = send_recv_msg();
+            stmt.setDirectXaslId(inBuffer.readBytes(28));
+        }
+
         pooled_ustmts.add(stmt);
 
         return stmt;
+    }
+
+    boolean isDirectPreparedPoc() {
+        return connectionProperties.getDirectPreparedPoc();
+    }
+
+    int executeDirectSelect1(byte[] packedXaslId) throws IOException {
+        throw new IOException("JDBC direct PoC is unavailable for this connection");
     }
 
     // UFunctionCode.RELATED_TO_COLLECTION

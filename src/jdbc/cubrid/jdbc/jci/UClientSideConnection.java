@@ -55,6 +55,7 @@ public class UClientSideConnection extends UConnection {
 
     private ArrayList<String> altHosts = null;
     private int connectedHostId = 0;
+    private UDirectPocConnection directPocConnection = null;
 
     private long lastFailureTime = 0;
 
@@ -111,6 +112,19 @@ public class UClientSideConnection extends UConnection {
             setBeginTime();
             checkReconnect();
             endTransaction(true);
+            if (connectionProperties.getDirectPreparedPoc()) {
+                if (connectionProperties.getUseLazyConnection()
+                        || connectionProperties.getDirectServerPort() == 0) {
+                    throw new IOException(
+                            "directPreparedPoc requires directServerPort and non-lazy connection");
+                }
+                directPocConnection = new UDirectPocConnection();
+                directPocConnection.connect(
+                        casIp,
+                        connectionProperties.getDirectServerPort(),
+                        dbname,
+                        connectionProperties.getConnectTimeout() * 1000);
+            }
         } catch (UJciException e) {
             clientSocketClose();
             e.toUError(errorHandler);
@@ -476,6 +490,10 @@ public class UClientSideConnection extends UConnection {
 
     @Override
     protected void closeInternal() {
+        if (directPocConnection != null) {
+            directPocConnection.close();
+            directPocConnection = null;
+        }
         // jci 3.0
         if (client != null) {
             disconnect();
@@ -490,5 +508,13 @@ public class UClientSideConnection extends UConnection {
 
         // System.gc();
         // UJCIManager.deleteInList(this);
+    }
+
+    @Override
+    int executeDirectSelect1(byte[] packedXaslId) throws IOException {
+        if (directPocConnection == null) {
+            throw new IOException("JDBC direct PoC connection is not open");
+        }
+        return directPocConnection.executeSelect1(packedXaslId);
     }
 }
