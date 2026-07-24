@@ -368,12 +368,17 @@ public class UClientSideConnection extends UConnection {
         boolean keepConnection = true;
         long currentTime = System.currentTimeMillis() / 1000;
         int reconnectTime = connectionProperties.getReconnectTime();
-        UUnreachableHostList unreachableHosts = UUnreachableHostList.getInstance();
 
         if (connectedHostId > 0
                 && lastFailureTime != 0
                 && reconnectTime > 0
                 && currentTime - lastFailureTime > reconnectTime) {
+            /*
+             * fetch the singleton only on this rare failover branch: the
+             * synchronized static getInstance() is a process-global monitor and
+             * must stay out of the per-statement auto-commit hot path
+             */
+            UUnreachableHostList unreachableHosts = UUnreachableHostList.getInstance();
             if (!unreachableHosts.contains(altHosts.get(0))) {
                 keepConnection = false;
                 lastFailureTime = 0;
