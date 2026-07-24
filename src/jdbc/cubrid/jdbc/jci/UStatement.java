@@ -901,36 +901,84 @@ public class UStatement {
         return serverHandler;
     }
 
-    boolean isDirectSelect1Candidate() {
-        if (commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT || parameterNumber != 0) {
+    boolean isDirectCandidate() {
+        if (commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT || columnInfo == null) {
             return false;
         }
-        String normalized = sql_stmt == null ? "" : sql_stmt.trim();
-        if (normalized.endsWith(";")) {
-            normalized = normalized.substring(0, normalized.length() - 1).trim();
+        for (int i = 0; i < columnInfo.length; i++) {
+            byte type = columnInfo[i].getColumnType();
+            if (type != UUType.U_TYPE_INT && type != UUType.U_TYPE_VARCHAR) {
+                return false;
+            }
         }
-        return normalized.equalsIgnoreCase("select 1");
+        return true;
     }
 
     void setDirectXaslId(byte[] packedXaslId) {
         directXaslId = packedXaslId;
     }
 
-    private void executeDirectSelect1() throws IOException {
-        int value = relatedConnection.executeDirectSelect1(directXaslId);
+    /*
+     * Attempts the direct-server execute path. Returns false when the statement
+     * must be demoted to the normal CAS path (e.g. unsupported bind type).
+     */
+    private boolean tryExecuteDirect() throws IOException {
+        if (directXaslId == null
+                || !isDirectCandidate()
+                || !relatedConnection.getAutoCommit()) {
+            return false;
+        }
 
-        executeResult = 1;
-        totalTupleNumber = 1;
-        fetchedTupleNumber = 1;
-        fetchedSize = Integer.SIZE / Byte.SIZE;
+        int paramCount = parameterNumber;
+        int[] tags = new int[paramCount];
+        byte[][] payloads = new byte[paramCount][];
+        for (int i = 0; i < paramCount; i++) {
+            Object value = bindParameter.values[i];
+            byte type = bindParameter.types[i];
+            if (value == null || type == UUType.U_TYPE_NULL) {
+                tags[i] = UDirectPocConnection.TYPE_NULL;
+                payloads[i] = null;
+            } else if (type == UUType.U_TYPE_VARCHAR && value instanceof String) {
+                tags[i] = UDirectPocConnection.TYPE_VARCHAR;
+                payloads[i] = ((String) value).getBytes(relatedConnection.getCharset());
+            } else if (type == UUType.U_TYPE_INT && value instanceof Integer) {
+                tags[i] = UDirectPocConnection.TYPE_INT;
+                payloads[i] =
+                        java.nio.ByteBuffer.allocate(4)
+                                .putInt(((Integer) value).intValue())
+                                .array();
+            } else {
+                /* unsupported bind type: demote to the CAS path */
+                return false;
+            }
+        }
+
+        /* decode result values with each column's charset, mirroring the CAS fetch path */
+        String[] columnCharsets = new String[columnNumber];
+        for (int i = 0; i < columnNumber; i++) {
+            columnCharsets[i] = columnInfo[i].getColumnCharset();
+        }
+
+        Object[][] rows = relatedConnection.executeDirect(directXaslId, tags, payloads, columnCharsets);
+
+        executeResult = rows.length;
+        totalTupleNumber = rows.length;
+        fetchedTupleNumber = rows.length;
+        fetchedSize = 0;
         currentFirstCursor = 0;
         cursorPosition = -1;
         isFetchCompleted = true;
         realFetched = true;
 
-        resultInfo = new UResultInfo[] {new UResultInfo(commandTypeIs, 1)};
-        tuples = new UResultTuple[] {new UResultTuple(1, columnNumber)};
-        tuples[0].setAttribute(0, Integer.valueOf(value));
+        resultInfo = new UResultInfo[] {new UResultInfo(commandTypeIs, rows.length)};
+        tuples = new UResultTuple[rows.length];
+        for (int r = 0; r < rows.length; r++) {
+            tuples[r] = new UResultTuple(r + 1, columnNumber);
+            for (int c = 0; c < columnNumber; c++) {
+                tuples[r].setAttribute(c, rows[r][c]);
+            }
+        }
+        return true;
     }
 
     public synchronized void execute(
@@ -988,11 +1036,7 @@ public class UStatement {
         boolean isFirstExecInTran = !relatedConnection.isActive();
 
         try {
-            if (relatedConnection.isDirectPreparedPoc()) {
-                if (directXaslId == null || !isDirectSelect1Candidate() || !relatedConnection.getAutoCommit()) {
-                    throw new UJciException(UErrorCode.CAS_ER_NOT_IMPLEMENTED);
-                }
-                executeDirectSelect1();
+            if (relatedConnection.isDirectPreparedPoc() && tryExecuteDirect()) {
                 return;
             }
             executeInternal(maxRow, maxField, isScrollable, queryTimeout, cacheData);

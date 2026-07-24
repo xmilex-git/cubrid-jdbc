@@ -511,10 +511,11 @@ public class UClientSideConnection extends UConnection {
     }
 
     @Override
-    int executeDirectSelect1(byte[] packedXaslId) throws IOException {
+    Object[][] executeDirect(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,
+            String[] columnCharsets) throws IOException {
         if (directPocConnection == null) {
             throw new IOException("JDBC direct PoC connection is not open");
         }
-        return directPocConnection.executeSelect1(packedXaslId);
+        return directPocConnection.execute(packedXaslId, paramTags, paramPayloads, columnCharsets);
     }
 }

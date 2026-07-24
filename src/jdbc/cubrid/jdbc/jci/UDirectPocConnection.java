@@ -49,8 +49,13 @@ final class UDirectPocConnection implements Closeable {
      * that the Java and engine constants remain synchronized.
      */
     private static final int NET_SERVER_JDBC_DIRECT_POC_ATTACH = 189;
-    private static final int NET_SERVER_JDBC_DIRECT_POC_EXECUTE_SELECT1 = 190;
-    private static final int PROTOCOL_VERSION = 1;
+    private static final int NET_SERVER_JDBC_DIRECT_POC_EXECUTE = 190;
+    private static final int PROTOCOL_VERSION = 2;
+
+    /* value type tags shared with the engine direct PoC handler */
+    static final int TYPE_NULL = 0;
+    static final int TYPE_INT = 1;
+    static final int TYPE_VARCHAR = 2;
 
     private Socket socket;
     private DataInputStream input;
@@ -106,34 +111,97 @@ final class UDirectPocConnection implements Closeable {
         transactionId = attachedTransactionId;
     }
 
-    int executeSelect1(byte[] packedXaslId) throws IOException {
+    Object[][] execute(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,
+            String[] columnCharsets) throws IOException {
         if (packedXaslId == null || packedXaslId.length != 28) {
             throw new IOException("invalid direct PoC XASL identifier");
         }
 
+        int paramCount = paramTags == null ? 0 : paramTags.length;
+        int requestSize = 4 + packedXaslId.length + 4;
+        for (int i = 0; i < paramCount; i++) {
+            int len = paramPayloads[i] == null ? 0 : paramPayloads[i].length;
+            requestSize += 8 + pad4(len);
+        }
+
+        ByteBuffer request = ByteBuffer.allocate(requestSize).order(ByteOrder.BIG_ENDIAN);
+        request.putInt(PROTOCOL_VERSION);
+        request.put(packedXaslId);
+        request.putInt(paramCount);
+        for (int i = 0; i < paramCount; i++) {
+            byte[] payload = paramPayloads[i] == null ? new byte[0] : paramPayloads[i];
+            request.putInt(paramTags[i]);
+            request.putInt(payload.length);
+            request.put(payload);
+            for (int pad = pad4(payload.length) - payload.length; pad > 0; pad--) {
+                request.put((byte) 0);
+            }
+        }
+
         int executeRequestId =
-                sendRequest(
-                        NET_SERVER_JDBC_DIRECT_POC_EXECUTE_SELECT1,
-                        packedXaslId,
-                        transactionId);
+                sendRequest(NET_SERVER_JDBC_DIRECT_POC_EXECUTE, request.array(), transactionId);
         ByteBuffer response = receiveData(executeRequestId);
-        requireRemaining(response, 20);
+        requireAtLeast(response, 20);
         int version = response.getInt();
         int result = response.getInt();
-        int rowCount = response.getInt();
-        int value = response.getInt();
         response.getInt(); // transaction state; retained for protocol diagnostics
+        int rowCount = response.getInt();
+        int colCount = response.getInt();
 
-        if (version != PROTOCOL_VERSION || result != 0 || rowCount != 1) {
+        if (version != PROTOCOL_VERSION || result != 0 || rowCount < 0 || colCount < 0) {
             throw new IOException(
-                    "JDBC direct SELECT 1 failed: version="
+                    "JDBC direct execute failed: version="
                             + version
-                            + ", result="
+                            + ", server error="
                             + result
                             + ", rows="
                             + rowCount);
         }
-        return value;
+
+        Object[][] rows = new Object[rowCount][];
+        for (int r = 0; r < rowCount; r++) {
+            Object[] row = new Object[colCount];
+            for (int c = 0; c < colCount; c++) {
+                requireAtLeast(response, 8);
+                int tag = response.getInt();
+                int len = response.getInt();
+                if (tag == TYPE_NULL && len == 0) {
+                    row[c] = null;
+                } else if (tag == TYPE_INT && len == 4) {
+                    requireAtLeast(response, 4);
+                    row[c] = Integer.valueOf(response.getInt());
+                } else if (tag == TYPE_VARCHAR && len >= 0) {
+                    int padded = pad4(len);
+                    requireAtLeast(response, padded);
+                    byte[] bytes = new byte[len];
+                    response.get(bytes);
+                    response.position(response.position() + (padded - len));
+                    String charset =
+                            columnCharsets != null && c < columnCharsets.length
+                                    ? columnCharsets[c]
+                                    : null;
+                    row[c] = charset == null ? new String(bytes) : new String(bytes, charset);
+                } else {
+                    throw new IOException("JDBC direct execute: bad value tag " + tag);
+                }
+            }
+            rows[r] = row;
+        }
+        return rows;
+    }
+
+    private static int pad4(int length) {
+        return (length + 3) & ~3;
+    }
+
+    private static void requireAtLeast(ByteBuffer buffer, int expected) throws IOException {
+        if (buffer.remaining() < expected) {
+            throw new IOException(
+                    "truncated direct PoC response: remaining "
+                            + buffer.remaining()
+                            + ", expected at least "
+                            + expected);
+        }
     }
 
     @Override
