@@ -128,6 +128,8 @@ public class UStatement {
     private boolean isAutoCommit = false;
     private boolean isGeneratedKeys = false;
     private byte[] directXaslId = null;
+    /* engine error_code.h ER_QPROC_INVALID_XASLNODE: cached XASL was invalidated */
+    private static final int ER_QPROC_INVALID_XASLNODE = -452;
 
     /*
      * 3.0 private int resultset_index; private int resultset_index_flag;
@@ -902,12 +904,28 @@ public class UStatement {
     }
 
     boolean isDirectCandidate() {
-        if (commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT || columnInfo == null) {
+        boolean isDml =
+                commandTypeIs == CUBRIDCommandType.CUBRID_STMT_INSERT
+                        || commandTypeIs == CUBRIDCommandType.CUBRID_STMT_UPDATE
+                        || commandTypeIs == CUBRIDCommandType.CUBRID_STMT_DELETE;
+        if (commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT && !isDml) {
+            return false;
+        }
+        if (isDml) {
+            return true;
+        }
+        if (columnInfo == null) {
             return false;
         }
         for (int i = 0; i < columnInfo.length; i++) {
             byte type = columnInfo[i].getColumnType();
-            if (type != UUType.U_TYPE_INT && type != UUType.U_TYPE_VARCHAR) {
+            if (type != UUType.U_TYPE_INT
+                    && type != UUType.U_TYPE_VARCHAR
+                    && type != UUType.U_TYPE_CHAR
+                    && type != UUType.U_TYPE_BIGINT
+                    && type != UUType.U_TYPE_SHORT
+                    && type != UUType.U_TYPE_FLOAT
+                    && type != UUType.U_TYPE_DOUBLE) {
                 return false;
             }
         }
@@ -933,7 +951,7 @@ public class UStatement {
             boolean isQueryPlan,
             boolean isOnlyPlan,
             int queryTimeout)
-            throws IOException {
+            throws IOException, UJciException {
         if (directXaslId == null
                 || !isDirectCandidate()
                 || !relatedConnection.getAutoCommit()
@@ -971,6 +989,30 @@ public class UStatement {
                         java.nio.ByteBuffer.allocate(4)
                                 .putInt(((Integer) value).intValue())
                                 .array();
+            } else if (type == UUType.U_TYPE_SHORT && value instanceof Short) {
+                tags[i] = UDirectPocConnection.TYPE_SHORT;
+                payloads[i] =
+                        java.nio.ByteBuffer.allocate(4)
+                                .putInt(((Short) value).intValue())
+                                .array();
+            } else if (type == UUType.U_TYPE_BIGINT && value instanceof Long) {
+                tags[i] = UDirectPocConnection.TYPE_BIGINT;
+                payloads[i] =
+                        java.nio.ByteBuffer.allocate(8)
+                                .putLong(((Long) value).longValue())
+                                .array();
+            } else if (type == UUType.U_TYPE_FLOAT && value instanceof Float) {
+                tags[i] = UDirectPocConnection.TYPE_FLOAT;
+                payloads[i] =
+                        java.nio.ByteBuffer.allocate(4)
+                                .putFloat(((Float) value).floatValue())
+                                .array();
+            } else if (type == UUType.U_TYPE_DOUBLE && value instanceof Double) {
+                tags[i] = UDirectPocConnection.TYPE_DOUBLE;
+                payloads[i] =
+                        java.nio.ByteBuffer.allocate(8)
+                                .putDouble(((Double) value).doubleValue())
+                                .array();
             } else {
                 /* unsupported bind type: demote to the CAS path */
                 return false;
@@ -983,17 +1025,68 @@ public class UStatement {
             columnCharsets[i] = columnInfo[i].getColumnCharset();
         }
 
-        Object[][] rows = relatedConnection.executeDirect(directXaslId, tags, payloads, columnCharsets);
+        boolean isDml = commandTypeIs != CUBRIDCommandType.CUBRID_STMT_SELECT;
+        UDirectPocConnection.Result result;
+        try {
+            result = relatedConnection.executeDirect(directXaslId, isDml, tags, payloads, columnCharsets);
+        } catch (UDirectPocConnection.ServerException e) {
+            if (e.serverError == ER_QPROC_INVALID_XASLNODE) {
+                /*
+                 * The cached XASL was invalidated (DDL, statistics, cache eviction).
+                 * Re-prepare through the CAS (refreshing directXaslId via take_xasl)
+                 * and retry the direct path once.
+                 */
+                reset((byte) 0);
+                try {
+                    result =
+                            relatedConnection.executeDirect(
+                                    directXaslId, isDml, tags, payloads, columnCharsets);
+                } catch (UDirectPocConnection.ServerException retryFailure) {
+                    throw toDbmsException(retryFailure);
+                }
+            } else {
+                /*
+                 * A server-reported execution error (e.g. constraint violation) is a
+                 * DBMS error, not a communication failure: surface errid + message
+                 * without tearing the connection down.
+                 */
+                throw toDbmsException(e);
+            }
+        }
 
-        executeResult = rows.length;
-        totalTupleNumber = rows.length;
-        fetchedTupleNumber = rows.length;
+        applyDirectResult(result);
+        return true;
+    }
+
+    private static UJciException toDbmsException(UDirectPocConnection.ServerException e) {
+        return new UJciException(
+                UErrorCode.ER_DBMS,
+                UErrorCode.DBMS_ERROR_INDICATOR,
+                e.serverError,
+                e.getMessage());
+    }
+
+    private void applyDirectResult(UDirectPocConnection.Result result) {
         fetchedSize = 0;
         currentFirstCursor = 0;
         cursorPosition = -1;
         isFetchCompleted = true;
         realFetched = true;
 
+        if (result.rows == null) {
+            /* server-side DML: affected-row count, no result set */
+            executeResult = result.affectedRows;
+            totalTupleNumber = 0;
+            fetchedTupleNumber = 0;
+            tuples = new UResultTuple[0];
+            resultInfo = new UResultInfo[] {new UResultInfo(commandTypeIs, result.affectedRows)};
+            return;
+        }
+
+        Object[][] rows = result.rows;
+        executeResult = rows.length;
+        totalTupleNumber = rows.length;
+        fetchedTupleNumber = rows.length;
         resultInfo = new UResultInfo[] {new UResultInfo(commandTypeIs, rows.length)};
         tuples = new UResultTuple[rows.length];
         for (int r = 0; r < rows.length; r++) {
@@ -1002,7 +1095,6 @@ public class UStatement {
                 tuples[r].setAttribute(c, rows[r][c]);
             }
         }
-        return true;
     }
 
     public synchronized void execute(
@@ -1152,6 +1244,8 @@ public class UStatement {
         relatedConnection.pooled_ustmts.add(this);
 
         init(relatedConnection, tmp.tmp_inbuffer, sql_stmt, prepare_flag, false);
+        /* re-prepare went through prepareInternal, which refreshed take_xasl on tmp */
+        directXaslId = tmp.directXaslId;
     }
 
     public synchronized CUBRIDOID executeInsert(boolean isAsync) {

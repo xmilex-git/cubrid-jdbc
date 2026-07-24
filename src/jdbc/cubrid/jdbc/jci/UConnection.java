@@ -1379,8 +1379,8 @@ public abstract class UConnection {
         return lastIsolationLevel == CUBRIDIsolationLevel.TRAN_READ_COMMITTED;
     }
 
-    Object[][] executeDirect(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,
-            String[] columnCharsets) throws IOException {
+    UDirectPocConnection.Result executeDirect(byte[] packedXaslId, boolean dml, int[] paramTags,
+            byte[][] paramPayloads, String[] columnCharsets) throws IOException {
         throw new IOException("JDBC direct PoC is unavailable for this connection");
     }
 

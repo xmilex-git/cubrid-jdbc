@@ -123,6 +123,7 @@ public class UClientSideConnection extends UConnection {
                         casIp,
                         connectionProperties.getDirectServerPort(),
                         dbname,
+                        user,
                         connectionProperties.getConnectTimeout() * 1000);
             }
         } catch (UJciException e) {
@@ -516,11 +517,11 @@ public class UClientSideConnection extends UConnection {
     }
 
     @Override
-    Object[][] executeDirect(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,
-            String[] columnCharsets) throws IOException {
+    UDirectPocConnection.Result executeDirect(byte[] packedXaslId, boolean dml, int[] paramTags,
+            byte[][] paramPayloads, String[] columnCharsets) throws IOException {
         if (directPocConnection == null) {
             throw new IOException("JDBC direct PoC connection is not open");
         }
-        return directPocConnection.execute(packedXaslId, paramTags, paramPayloads, columnCharsets);
+        return directPocConnection.execute(packedXaslId, dml, paramTags, paramPayloads, columnCharsets);
     }
 }

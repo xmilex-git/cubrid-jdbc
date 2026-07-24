@@ -50,12 +50,40 @@ final class UDirectPocConnection implements Closeable {
      */
     private static final int NET_SERVER_JDBC_DIRECT_POC_ATTACH = 189;
     private static final int NET_SERVER_JDBC_DIRECT_POC_EXECUTE = 190;
-    private static final int PROTOCOL_VERSION = 2;
+    private static final int PROTOCOL_VERSION = 3;
 
     /* value type tags shared with the engine direct PoC handler */
     static final int TYPE_NULL = 0;
     static final int TYPE_INT = 1;
     static final int TYPE_VARCHAR = 2;
+    static final int TYPE_BIGINT = 3;
+    static final int TYPE_SHORT = 4;
+    static final int TYPE_FLOAT = 5;
+    static final int TYPE_DOUBLE = 6;
+    static final int TYPE_CHAR = 7;
+
+    /** direct execute outcome: DML carries affectedRows and rows == null */
+    static final class Result {
+        final int affectedRows;
+        final Object[][] rows;
+
+        Result(int affectedRows, Object[][] rows) {
+            this.affectedRows = affectedRows;
+            this.rows = rows;
+        }
+    }
+
+    /** server-reported execution failure (errid + server message) */
+    static final class ServerException extends IOException {
+        private static final long serialVersionUID = 1L;
+        final int serverError;
+
+        ServerException(int serverError, String message) {
+            super("direct execute failed: server error " + serverError
+                    + (message == null || message.isEmpty() ? "" : " - " + message));
+            this.serverError = serverError;
+        }
+    }
 
     private Socket socket;
     private DataInputStream input;
@@ -64,7 +92,7 @@ final class UDirectPocConnection implements Closeable {
     private int transactionId = NULL_TRAN_INDEX;
     private boolean paddedRequests;
 
-    void connect(String host, int masterPort, String databaseName, int timeoutMillis)
+    void connect(String host, int masterPort, String databaseName, String dbUser, int timeoutMillis)
             throws IOException {
         InetAddress address = InetAddress.getByName(host);
         if (!address.isLoopbackAddress()) {
@@ -91,10 +119,20 @@ final class UDirectPocConnection implements Closeable {
         }
 
         paddedRequests = true;
+        byte[] userBytes =
+                (dbUser == null ? "" : dbUser).getBytes(StandardCharsets.UTF_8);
+        ByteBuffer attachReq =
+                ByteBuffer.allocate(8 + pad4(userBytes.length)).order(ByteOrder.BIG_ENDIAN);
+        attachReq.putInt(PROTOCOL_VERSION);
+        attachReq.putInt(userBytes.length);
+        attachReq.put(userBytes);
+        for (int pad = pad4(userBytes.length) - userBytes.length; pad > 0; pad--) {
+            attachReq.put((byte) 0);
+        }
         int attachRequestId =
-                sendRequest(NET_SERVER_JDBC_DIRECT_POC_ATTACH, null, NULL_TRAN_INDEX);
+                sendRequest(NET_SERVER_JDBC_DIRECT_POC_ATTACH, attachReq.array(), NULL_TRAN_INDEX);
         ByteBuffer attach = receiveData(attachRequestId);
-        requireRemaining(attach, 12);
+        requireAtLeast(attach, 12);
         int version = attach.getInt();
         int result = attach.getInt();
         int attachedTransactionId = attach.getInt();
@@ -111,14 +149,14 @@ final class UDirectPocConnection implements Closeable {
         transactionId = attachedTransactionId;
     }
 
-    Object[][] execute(byte[] packedXaslId, int[] paramTags, byte[][] paramPayloads,
+    Result execute(byte[] packedXaslId, boolean dml, int[] paramTags, byte[][] paramPayloads,
             String[] columnCharsets) throws IOException {
         if (packedXaslId == null || packedXaslId.length != 28) {
             throw new IOException("invalid direct PoC XASL identifier");
         }
 
         int paramCount = paramTags == null ? 0 : paramTags.length;
-        int requestSize = 4 + packedXaslId.length + 4;
+        int requestSize = 4 + 4 + packedXaslId.length + 4;
         for (int i = 0; i < paramCount; i++) {
             int len = paramPayloads[i] == null ? 0 : paramPayloads[i].length;
             requestSize += 8 + pad4(len);
@@ -126,6 +164,7 @@ final class UDirectPocConnection implements Closeable {
 
         ByteBuffer request = ByteBuffer.allocate(requestSize).order(ByteOrder.BIG_ENDIAN);
         request.putInt(PROTOCOL_VERSION);
+        request.putInt(dml ? 1 : 0); /* statement kind: 0 = SELECT, 1 = DML */
         request.put(packedXaslId);
         request.putInt(paramCount);
         for (int i = 0; i < paramCount; i++) {
@@ -141,22 +180,39 @@ final class UDirectPocConnection implements Closeable {
         int executeRequestId =
                 sendRequest(NET_SERVER_JDBC_DIRECT_POC_EXECUTE, request.array(), transactionId);
         ByteBuffer response = receiveData(executeRequestId);
-        requireAtLeast(response, 20);
+        requireAtLeast(response, 24);
         int version = response.getInt();
         int result = response.getInt();
         response.getInt(); // transaction state; retained for protocol diagnostics
+        int affectedRows = response.getInt();
         int rowCount = response.getInt();
         int colCount = response.getInt();
 
-        if (version != PROTOCOL_VERSION || result != 0 || rowCount < 0 || colCount < 0) {
-            throw new IOException(
-                    "JDBC direct execute failed: version="
-                            + version
-                            + ", server error="
-                            + result
-                            + ", rows="
-                            + rowCount);
+        if (version != PROTOCOL_VERSION) {
+            throw new IOException("JDBC direct execute: protocol version mismatch " + version);
         }
+        if (result != 0) {
+            /* failure payload: {msgLen, msg bytes padded} */
+            String message = null;
+            if (response.remaining() >= 4) {
+                int msgLen = response.getInt();
+                if (msgLen > 0 && msgLen <= response.remaining()) {
+                    byte[] msg = new byte[msgLen];
+                    response.get(msg);
+                    message = new String(msg, StandardCharsets.UTF_8);
+                }
+            }
+            throw new ServerException(result, message);
+        }
+        if (rowCount < 0 || colCount < 0) {
+            throw new IOException("JDBC direct execute: bad shape " + rowCount + "x" + colCount);
+        }
+
+        if (colCount == 0) {
+            /* server-side DML: no result columns */
+            return new Result(affectedRows, null);
+        }
+
         /*
          * Sanity-check the advertised shape against the actual payload before
          * allocating arrays: every value occupies at least 8 bytes (tag+length).
@@ -183,7 +239,19 @@ final class UDirectPocConnection implements Closeable {
                 } else if (tag == TYPE_INT && len == 4) {
                     requireAtLeast(response, 4);
                     row[c] = Integer.valueOf(response.getInt());
-                } else if (tag == TYPE_VARCHAR && len >= 0) {
+                } else if (tag == TYPE_SHORT && len == 4) {
+                    requireAtLeast(response, 4);
+                    row[c] = Short.valueOf((short) response.getInt());
+                } else if (tag == TYPE_BIGINT && len == 8) {
+                    requireAtLeast(response, 8);
+                    row[c] = Long.valueOf(response.getLong());
+                } else if (tag == TYPE_FLOAT && len == 4) {
+                    requireAtLeast(response, 4);
+                    row[c] = Float.valueOf(response.getFloat());
+                } else if (tag == TYPE_DOUBLE && len == 8) {
+                    requireAtLeast(response, 8);
+                    row[c] = Double.valueOf(response.getDouble());
+                } else if ((tag == TYPE_VARCHAR || tag == TYPE_CHAR) && len >= 0) {
                     int padded = pad4(len);
                     requireAtLeast(response, padded);
                     byte[] bytes = new byte[len];
@@ -200,7 +268,7 @@ final class UDirectPocConnection implements Closeable {
             }
             rows[r] = row;
         }
-        return rows;
+        return new Result(-1, rows);
     }
 
     private static int pad4(int length) {
